@@ -1,5 +1,10 @@
 const { ipcRenderer: ipc } = require('electron');
-require("os").setPriority(0, require("os").constants.priority.PRIORITY_BELOW_NORMAL)
+const StackBlur = require('stackblur-canvas');
+window.StackBlur = StackBlur
+const { setPriority } = require("os")
+const { priority } = require("os").constants
+
+setPriority(0, priority.PRIORITY_BELOW_NORMAL)
 
 // Send logs to main thread
 const log = console.log
@@ -13,10 +18,13 @@ console.error = (...e) => { e.forEach((c) => { ipc.send('log', c); con.error(c) 
 
 window.winPosition = { x: 0, y: 0, width: 0, height: 0 }
 
+let jsVars
 function getArgumentVars() {
     try {
+        if(jsVars) return jsVars;
+
         const jsVarsString = process.argv.find(arg => arg.indexOf("jsVars") === 0)
-        const jsVars = JSON.parse(atob(jsVarsString.substring(6)))
+        jsVars = JSON.parse(atob(jsVarsString.substring(6)))
         return jsVars
     } catch(e) {
         return {}
@@ -28,6 +36,7 @@ function setPanelVisibility(visible) {
     window.showPanel = visible
 
     if (visible) {
+        setPriority(0, priority.PRIORITY_ABOVE_NORMAL)
         window.document.body.dataset["visible"] = true
         window.dispatchEvent(new CustomEvent('sleepUpdated', {
             detail: false
@@ -41,6 +50,7 @@ function setPanelVisibility(visible) {
         }
         window.updateMica?.()
     } else {
+        setPriority(0, priority.PRIORITY_BELOW_NORMAL)
         window.document.body.dataset["visible"] = false
         window.document.body.dataset["acrylicShow"] = false
         if (window.isAcrylic) {
@@ -83,6 +93,7 @@ function updateBrightness(index, level) {
 }
 
 function detectSunValley() {
+    if(!window.reactReady) return false;
     try {
         // Detect new Fluent Icons (Windows build 21327+)
         if(window.settings.enableSunValley && document.fonts.check("12px Segoe Fluent Icons")) {
@@ -112,7 +123,10 @@ function openSettings() {
 }
 
 function sendSettings(newSettings) {
-    ipc.send('send-settings', newSettings)
+    ipc.send('send-settings', {
+        newSettings,
+        sendUpdate: true
+    })
 }
 
 function requestSettings() {
@@ -144,8 +158,10 @@ function panelAnimationDone() {
 function shouldSendHeightUpdate() {
     setTimeout(() => {
         try {
-            const height = window.document.getElementById("panel").offsetHeight
-            window.sendHeight(height)
+            if(window.document.getElementById("panel")) {
+                const height = window.document.getElementById("panel").offsetHeight
+                window.sendHeight(height)
+            }
         } catch(e) {
             console.error(e)
         }
@@ -188,7 +204,6 @@ ipc.on("panel-unsleep", () => {
 
 // Monitor info updated
 ipc.on("monitors-updated", (e, monitors) => {
-    if (JSON.stringify(window.allMonitors) === JSON.stringify(monitors)) return false;
     window.allMonitors = monitors
     window.lastUpdate = Date.now()
     window.dispatchEvent(new CustomEvent('monitorsUpdated', {
@@ -233,13 +248,21 @@ ipc.on('request-height', () => {
     ipc.send('panel-height', window.document.getElementById("panel").offsetHeight)
 })
 
+// Taskbar position recieved
+ipc.on('isRefreshing', (event, newValue) => {
+    window.isRefreshing = newValue
+    window.dispatchEvent(new CustomEvent('isRefreshing', {
+        detail: newValue
+    }))
+})
+
 // Settings recieved
 ipc.on('settings-updated', (event, settings) => {
     if (settings.isDev == false) {
-        console.log = () => { }
-    } else {
-        console.log = log
+        // Keep forwarding to the main process session log; stay quiet in DevTools
         console.log = (...e) => { e.forEach((c) => ipc.send('log', c)) }
+    } else {
+        console.log = (...e) => { e.forEach((c) => { ipc.send('log', c); con.log(c) }) }
     }
     window.settings = settings
     detectSunValley()
@@ -283,6 +306,7 @@ ipc.on('theme-settings', (event, theme) => {
     try {
         window.theme = (theme.SystemUsesLightTheme == 0 ? "dark" : "light")
         window.document.body.dataset["systemTheme"] = (theme.SystemUsesLightTheme == 0 ? "dark" : "light")
+        window.document.body.dataset["theme"] = (settings.theme == "dark" || settings.theme == "light" ? settings.theme : window.theme)
         window.document.body.dataset["transparent"] = (theme.EnableTransparency == 0 || theme.UseAcrylic == 0 ? "false" : "true")
         window.document.body.dataset["acrylic"] = (theme.UseAcrylic == 0 || settings?.isWin11 ? "false" : "true")
         window.document.body.dataset["coloredTaskbar"] = (theme.ColorPrevalence == 0 ? "false" : "true")
@@ -290,6 +314,7 @@ ipc.on('theme-settings', (event, theme) => {
         isTransparent = theme.EnableTransparency
     } catch (e) {
         window.document.body.dataset["systemTheme"] = "default"
+        window.document.body.dataset["theme"] = "dark"
         window.document.body.dataset["transparent"] = "false"
         window.document.body.dataset["acrylic"] = "false"
         window.document.body.dataset["coloredTaskbar"] = "false"
@@ -322,20 +347,66 @@ ipc.on('mica-wallpaper', (event, wallpaper) => {
     if(!wallpaper) {
         mica.style.visibility = "hidden"
         window.micaState.visibility = "hidden"
-    } else {
+        return false
+    } 
+    
+    if(window.micaState.src !== wallpaper.path) {
         window.micaState.visibility = "visible"
+        window.micaState.wallpaper = wallpaper
         window.micaState.src = wallpaper.path
         mica.style.visibility = "visible"
         micaIMG.src = wallpaper.path
-        micaIMG.width = wallpaper.size?.width
-        micaIMG.height = wallpaper.size?.height
     }
+
+    micaIMG.width = wallpaper.size?.width
+    micaIMG.height = wallpaper.size?.height
+
 })
+
+let lastPath = ""
+ipc.on('mica-wallpaper-create', (event, wallpaper) => {
+    if(lastPath === wallpaper.path) {
+        lastPath = wallpaper.path
+        ipc.send('mica-wallpaper-same')
+        return false
+    }
+    lastPath = wallpaper.path
+    const img = new Image()
+
+    const ratio = wallpaper.size.width / wallpaper.size.height
+    
+    const canvas = document.createElement("canvas")
+    canvas.width = 500 * wallpaper.size.scale
+    canvas.height = (500 / ratio) * wallpaper.size.scale
+
+    img.addEventListener("load", () => {
+        fitImageToCanvas(img, canvas)
+        StackBlur.canvasRGB(canvas, 0, 0, canvas.width, canvas.height, 30 * wallpaper.size.scale )
+        const data = canvas.toDataURL("image/jpeg", 0.95)
+        ipc.send('mica-wallpaper-data', data)
+         
+    })
+    img.src = wallpaper.path
+})
+
+const fitImageToCanvas = (image,canvas) => {
+    const canvasContext = canvas.getContext("2d");
+    const ratio = image.width / image.height;
+    let newWidth = canvas.width;
+    let newHeight = newWidth / ratio;
+    if (newHeight < canvas.height) {
+      newHeight = canvas.height;
+      newWidth = newHeight * ratio;
+    }
+    const xOffset = newWidth > canvas.width ? (canvas.width - newWidth) / 2 : 0;
+    const yOffset =
+      newHeight > canvas.height ? (canvas.height - newHeight) / 2 : 0;
+    canvasContext.drawImage(image, xOffset, yOffset, newWidth, newHeight);
+  };
 
 // Request startup data
 window.addEventListener('DOMContentLoaded', () => {
     requestSettings()
-    //requestMonitors()
     requestAccent()
 })
 
@@ -345,6 +416,7 @@ const vcpMap = {
     0x13: "brightness",
     0x12: "contrast",
     0xD6: "powerState",
+    0x60: "inputs",
     0x62: "volume"
 }
 window.addEventListener("setVCP", e => {
@@ -373,6 +445,9 @@ window.allMonitors = []
 window.lastUpdate = Date.now()
 window.showPanel = false
 window.isAcrylic = false
+window.reactReady = false
 window.theme = "dark"
 window.settings = {}
+window.jsVars = getArgumentVars()
+window.isRefreshing = getArgumentVars().isRefreshing
 window.isAppX = (getArgumentVars().appName == "twinkle-tray-appx" ? true : false)

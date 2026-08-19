@@ -1,6 +1,4 @@
 const { ipcRenderer: ipc } = require('electron');
-const remote = require('@electron/remote')
-let browser = remote.getCurrentWindow()
 
 function getArgumentVars() {
     try {
@@ -47,12 +45,22 @@ function sendSettings(newSettings = {}) {
         sendSettingsThrottle = setTimeout(() => {
             actuallySendSettings()
             sendSettingsThrottle = false
-        }, 333)
+        }, 500)
     }
 }
 
+function sendSettingsImmediate(newSettings = {}) {
+    ipc.send('send-settings', {
+        newSettings,
+        sendUpdate: false
+    })
+}
+
 function actuallySendSettings() {
-    ipc.send('send-settings', sendSettingsObj)
+    ipc.send('send-settings', {
+        newSettings: sendSettingsObj,
+        sendUpdate: true
+    })
     sendSettingsObj = {}
 }
 
@@ -64,7 +72,16 @@ function resetSettings() {
     ipc.send('reset-settings')
 }
 
+function requestDDCSafetyStatus() {
+    ipc.send('request-ddc-safety-status')
+}
+
+function retryDDCValidation() {
+    ipc.send('retry-ddc-validation')
+}
+
 function detectSunValley() {
+    if(!window.reactReady) return false;
     try {
         // Detect new Fluent Icons (Windows build 21327+)
         if(window.settings.enableSunValley && document.fonts.check("12px Segoe Fluent Icons")) {
@@ -158,6 +175,25 @@ ipc.on('settings-updated', (event, settings) => {
     }))
 })
 
+ipc.on('native-brightness-key', (event, accelerator) => {
+    window.dispatchEvent(new CustomEvent('nativeBrightnessKey', {
+        detail: accelerator
+    }))
+})
+
+ipc.on('ddc-safety-status', (event, status) => {
+    window.dispatchEvent(new CustomEvent('ddcSafetyStatus', {
+        detail: status
+    }))
+})
+
+ipc.on('window-history', (event, history) => {
+    window.windowHistory = history
+    window.dispatchEvent(new CustomEvent('windowHistory', {
+        detail: history
+    }))
+})
+
 // Localization recieved
 ipc.on('localization-updated', (event, localization) => {
     window.dispatchEvent(new CustomEvent('localizationUpdated', {
@@ -167,7 +203,9 @@ ipc.on('localization-updated', (event, localization) => {
 
 const processTheme = (event, theme) => {
     try {
+        window.theme = (theme.SystemUsesLightTheme == 0 ? "dark" : "light")
         window.document.body.dataset["systemTheme"] = (theme.SystemUsesLightTheme == 0 ? "dark" : "light")
+        window.document.body.dataset["theme"] = (settings.theme == "dark" || settings.theme == "light" ? settings.theme : window.theme)
         window.document.body.dataset["transparent"] = (theme.EnableTransparency == 0 || theme.UseAcrylic == 0 ? "false" : "true")
         window.document.body.dataset["acrylic"] = (theme.UseAcrylic == 0 ? "false" : "true")
 
@@ -180,6 +218,7 @@ const processTheme = (event, theme) => {
         window.document.body.dataset["coloredTaskbar"] = (theme.ColorPrevalence == 0 ? "false" : "true")
     } catch (e) {
         window.document.body.dataset["systemTheme"] = "default"
+        window.document.body.dataset["theme"] = "dark"
         window.document.body.dataset["transparent"] = "false"
         window.document.body.dataset["acrylic"] = false
         window.document.body.dataset["coloredTaskbar"] = "false"
@@ -190,6 +229,8 @@ const processTheme = (event, theme) => {
 ipc.on('theme-settings', processTheme)
 
 ipc.on('mica-wallpaper', (event, wallpaper) => {
+    // Native Mica is used instead on Windows 11 22H2+
+    if (window.document.body.dataset.nativeMica === "true") return;
     const mica = document.querySelector("#mica .displays")
     const micaIMG = document.querySelector("#mica img")
     if(!wallpaper) {
@@ -204,6 +245,7 @@ ipc.on('mica-wallpaper', (event, wallpaper) => {
 
 // Request startup data
 window.addEventListener("DOMContentLoaded", () => {
+    window.document.body.dataset.nativeMica = (getArgumentVars().useNativeMica ? "true" : "false")
     processTheme(undefined, getArgumentVars().lastTheme)
     requestSettings()
     requestMonitors()
@@ -216,21 +258,43 @@ window.addEventListener("setVCP", e => {
     ipc.send("set-vcp", { monitor, code, value })
 })
 
+window.addEventListener("set-sdr-brightness", e => {
+    const { monitor, value } = e.detail
+    ipc.send("set-sdr-brightness", { monitor, value })
+})
+
+const SunCalc = require('suncalc')
+function getSunCalcTimes(lat, long) {
+    const localTimes = SunCalc.getTimes(new Date(), lat, long)
+    for (const timeName in localTimes) {
+        const time = localTimes[timeName].toLocaleTimeString()
+        localTimes[timeName] = `${time.slice(0,4)}${time.slice(7)}`
+    }
+    return localTimes
+}
+
 window.ipc = ipc
 window.updateBrightness = updateBrightness
 window.requestMonitors = requestMonitors
 window.sendSettings = sendSettings
+window.sendSettingsImmediate = sendSettingsImmediate
 window.requestSettings = requestSettings
 window.resetSettings = resetSettings
+window.requestDDCSafetyStatus = requestDDCSafetyStatus
+window.retryDDCValidation = retryDDCValidation
 window.getUpdate = getUpdate
 window.checkForUpdates = checkForUpdates
 window.openURL = openURL
 window.allMonitors = []
 window.lastUpdate = Date.now()
 window.showPanel = false
+window.reactReady = false
 window.settings = getArgumentVars().settings
-window.thisWindow = browser
 window.accent = "cyan"
+window.getSunCalcTimes = getSunCalcTimes
 
 window.version = 'v' + getArgumentVars().appVersion
+window.versionTag = getArgumentVars().appVersionTag
+window.versionBuild = getArgumentVars().appBuild
 window.isAppX = (getArgumentVars().appName == "twinkle-tray-appx" ? true : false)
+window.settingsPath = getArgumentVars().settingsPath

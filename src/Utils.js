@@ -1,14 +1,64 @@
 const path = require('path');
 const fs = require('fs')
 
+function udpSendCommand(type, data, port = 14715, key) {
+    return new Promise((resolve, reject) => {
+        const client = require('dgram').createSocket('udp4')
+        const udpTimeout = setTimeout(() => {
+            clearTimeout(udpTimeout)
+            reject("No response")
+        }, 1000)
+
+        client.on('message', (message, connection) => {
+            resolve(message?.toString())
+        })
+
+        client.send(JSON.stringify({ type, data, key }), port, "localhost", err => {
+            if (err) {
+                reject('Failed to send command')
+            }
+        })
+    })
+}
+
+function pipeSendCommand(type, data, port = 14715, key) {
+    return new Promise((resolve, reject) => {
+        const cmdTimeout = setTimeout(() => {
+            clearTimeout(cmdTimeout)
+            reject("No response")
+        }, 1000)
+
+        const client = require('net').connect('\\\\.\\pipe\\twinkle-tray\\cmds')
+
+        client.on('data', function(message) {
+            resolve(message?.toString())
+        })
+
+        try {
+            client.write(JSON.stringify({ type, data, key }))
+        } catch(e) {
+            reject('Failed to send command:', e)
+        }
+    })
+}
+
 module.exports = {
     unloadModule: (name) => {
         try {
-            delete require.cache[require.resolve(name)];
-            console.log(`Unloaded module: ${name}`)
-        } catch(e) {
+            if (require.cache[require.resolve(name)]) {
+                delete require.cache[require.resolve(name)]
+                console.log(`Unloaded module: ${name}`)
+            }
+        } catch (e) {
             console.log(`Couldn't unload module: ${name}`)
         }
+    },
+    wait(ms = 2000) {
+        return new Promise(resolve => {
+            setTimeout(() => {
+                resolve(true);
+            }, ms);
+        });
     },
     processArgs: (commandLine) => {
 
@@ -17,6 +67,11 @@ module.exports = {
         commandLine.forEach(argRaw => {
 
             const arg = argRaw.toLowerCase();
+
+            // Use UDP
+            if (arg.indexOf("--udp") === 0) {
+                validArgs.UseUDP = true
+            }
 
             // Get display by index
             if (arg.indexOf("--list") === 0) {
@@ -75,14 +130,25 @@ module.exports = {
         return validArgs
     },
 
-    handleProcessedArgs(args = {}, knownDisplaysPath) {
+    async handleProcessedArgs(args = {}, knownDisplaysPath, settingsPath) {
 
         let failed
+        const settings = JSON.parse(fs.readFileSync(settingsPath))
 
-        if(args.ShowPanel) {
+        if (args.ShowPanel) {
             console.log(`Showing panel`)
-        } else if(args.List) {
-            const displays = getKnownDisplays(knownDisplaysPath)
+        } else if (args.List) {
+            //const displays = getKnownDisplays(knownDisplaysPath)
+
+            const useUDP = (args.UseUDP ? true : false)
+            const response = await (useUDP ? udpSendCommand : pipeSendCommand)("list", false, settings.udpPortActive, settings.udpKey)
+            let displays = {}
+            try {
+                displays = JSON.parse(response || "")
+            } catch(e) {
+                console.log("Error parsing response")
+            }
+
             Object.values(displays).forEach(display => {
                 console.log(`
 \x1b[36mMonitorNum:\x1b[0m ${display.num}
@@ -91,6 +157,7 @@ module.exports = {
 \x1b[36mBrightness:\x1b[0m ${display.brightness}
 \x1b[36mType:\x1b[0m ${display.type}`)
             })
+
             failed = false;
             return true;
         } else {
@@ -161,7 +228,8 @@ Flag to show brightness levels in the panel
     upgradeAdjustmentTimes,
     getVersionValue,
     lerp,
-    parseTime
+    parseTime,
+    getCalibratedValue
 }
 
 
@@ -169,7 +237,7 @@ function upgradeAdjustmentTimes(times = []) {
     const newTimes = []
 
     times.forEach(time => {
-        if(time.time) {
+        if (time.time) {
             newTimes.push(time)
             return
         }
@@ -193,7 +261,7 @@ function upgradeAdjustmentTimes(times = []) {
 
 // Convert version to a numeric value (v1.2.3 = 10020003)
 function getVersionValue(version = 'v1.0.0') {
-    let out = version.split('-')[0].replace("v","").split(".")
+    let out = version.split('-')[0].replace("v", "").split(".")
     out = (out[0] * 10000 * 10000) + (out[1] * 10000) + (out[2] * 1)
     return parseInt(out)
 }
@@ -210,12 +278,94 @@ function parseTime(time) {
 function getKnownDisplays(knownDisplaysPath) {
     let known
     try {
-      // Load known displays DB
-      known = fs.readFileSync(knownDisplaysPath)
-      known = JSON.parse(known)
+        // Load known displays DB
+        known = fs.readFileSync(knownDisplaysPath)
+        known = JSON.parse(known)
     } catch (e) {
-      known = {}
+        known = {}
     }
-  
+
     return known
-  }
+}
+
+/**
+ * Maps a value (0–100) using calibration points.
+ * By default, maps input to output. Can also reverse map output back to input.
+ *
+ * @param {number} value - The value to map (expected range: 0–100).
+ * @param {Array<{input: number, output: number}>} calibrationPoints - 
+ *        An array of calibration points.
+ *        Example: [{input: 15, output: 30}, {input: 50, output: 60}]
+ * @param {boolean} reverse - If true, maps output to input. Default is false (input to output).
+ * @returns {number} - The mapped value.
+ */
+function getCalibratedValue(value, calibrationPoints = [], reverse = false) {
+    // Ensure value is within 0–100
+    value = Math.max(0, Math.min(100, value));
+
+    // Add default start and end points if not provided
+    const points = calibrationPoints.slice();
+
+    // Handle min/max values if those points haven't been provided
+    let hasMin = false;
+    let hasMax = false;
+    for (const point of points) {
+        point.input = Math.max(0, Math.min(100, point.input));
+        if (point.input === 0) hasMin = true;
+        if (point.input === 100) hasMax = true;
+    }
+
+    if (!hasMin) {
+        points.unshift({ input: 0, output: 0 });
+    }
+    if (!hasMax) {
+        points.push({ input: 100, output: 100 });
+    }
+
+    // Sort points by input value
+    points.sort((a, b) => a.input - b.input);
+
+    if (reverse) {
+        // Reverse mapping: output -> input
+        // Find the two points between which the output falls
+        for (let i = 0; i < points.length - 1; i++) {
+            const p1 = points[i];
+            const p2 = points[i + 1];
+
+            // Check if output falls between these two points
+            const minOutput = Math.min(p1.output, p2.output);
+            const maxOutput = Math.max(p1.output, p2.output);
+
+            if (value >= minOutput && value <= maxOutput) {
+                // Linear interpolation in reverse
+                if (p2.output === p1.output) {
+                    // If outputs are the same, return the midpoint input
+                    return (p1.input + p2.input) / 2;
+                }
+                const ratio = (value - p1.output) / (p2.output - p1.output);
+                return p1.input + ratio * (p2.input - p1.input);
+            }
+        }
+        // Fallback
+        return value;
+    } else {
+        // Forward mapping: input -> output
+        if (value === 0 && points.length > 0 && points[0].input === 0) {
+            return points[0].output;
+        }
+
+        // Find the two points between which the input falls
+        for (let i = 0; i < points.length - 1; i++) {
+            const p1 = points[i];
+            const p2 = points[i + 1];
+
+            if (value >= p1.input && value <= p2.input) {
+                // Linear interpolation
+                const ratio = (value - p1.input) / (p2.input - p1.input);
+                return p1.output + ratio * (p2.output - p1.output);
+            }
+        }
+        // Fallback
+        return value;
+    }
+}
